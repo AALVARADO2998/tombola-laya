@@ -79,7 +79,8 @@ export default function App() {
   const [resetOk, setResetOk] = useState(false);
   const [showRange, setShowRange] = useState(false);
   const [rangeForm, setRangeForm] = useState({ desde:"000", hasta:"100", vendedor:"", estado:"keep" });
-  const canvasRef = useRef(null);
+  const canvasRef     = useRef(null);
+  const prevTickets   = useRef(null); // para detectar solo los boletos que cambiaron
 
   useEffect(() => {
     (async () => {
@@ -102,19 +103,48 @@ export default function App() {
     })();
   }, []);
 
+  // Guarda SOLO los boletos que cambiaron (no los 101 cada vez)
   useEffect(() => {
     if (!tickets) return;
-    // Mapear formato interno → columnas de Supabase y guardar
-    const rows = tickets.map(t => ({
-      numero:    t.number,
-      estado:    t.status,
-      vendedor:  t.seller,
-      comprador: t.buyerName,
+    const prev = prevTickets.current;
+    prevTickets.current = tickets;
+    if (!prev) return; // primera carga, no guardar (ya vienen de Supabase)
+
+    const changed = tickets.filter((t, i) => {
+      const p = prev[i];
+      return !p || p.status !== t.status || p.seller !== t.seller || p.buyerName !== t.buyerName;
+    });
+    if (!changed.length) return;
+
+    const rows = changed.map(t => ({
+      numero: t.number, estado: t.status, vendedor: t.seller, comprador: t.buyerName,
     }));
     supabase.from("boletos").upsert(rows).then(({ error }) => {
       if (error) console.error("Error guardando:", error.message);
     });
   }, [tickets]);
+
+  // Escucha cambios en tiempo real — actualiza la pantalla al instante
+  useEffect(() => {
+    const channel = supabase
+      .channel("boletos-realtime")
+      .on("postgres_changes",
+        { event: "UPDATE", schema: "public", table: "boletos" },
+        ({ new: r }) => {
+          setTickets(prev => {
+            if (!prev) return prev;
+            return prev.map(t =>
+              t.number === r.numero
+                ? { number: r.numero, status: r.estado, seller: r.vendedor, buyerName: r.comprador }
+                : t
+            );
+          });
+        }
+      )
+      .subscribe();
+
+    return () => supabase.removeChannel(channel);
+  }, []);
 
   const fire = msg => { setToast(msg); setTimeout(() => setToast(null), 2800); };
 
@@ -209,35 +239,100 @@ export default function App() {
     ctx.fillText("Apóyanos a recaudar fondos para su operación",540,562);
     ctx.fillText("de adenoamigdalectomía 💗",540,606);
 
-    let y = 660;
-    const drawSection = (status, label, bgC, bdC, txC) => {
-      const list = (tickets??[]).filter(t=>t.status===status);
-      if (!list.length) return;
-      ctx.fillStyle=bdC; ctx.font="bold 42px Georgia,serif";
-      ctx.textAlign="center"; ctx.fillText(`${label}  (${list.length})`,540,y); y+=26;
-      const cols=9,cw=100,ch=70,gap=8;
-      const sx=(1080-(cols*cw+(cols-1)*gap))/2;
-      list.forEach((t,i)=>{
-        const cx=sx+(i%cols)*(cw+gap), cy=y+Math.floor(i/cols)*(ch+gap);
-        ctx.fillStyle=bgC; ctx.strokeStyle=bdC; ctx.lineWidth=2;
-        rRect(ctx,cx,cy,cw,ch,12); ctx.fill(); ctx.stroke();
-        ctx.fillStyle=txC; ctx.font="bold 30px 'Courier New',monospace";
-        ctx.textAlign="center"; ctx.fillText(t.number,cx+cw/2,cy+ch/2+10);
-      });
-      y+=Math.ceil(list.length/cols)*(ch+gap)+48;
-    };
-    if (exportOpts.available) drawSection("available","✨ Disponibles",C.lilaMedio,C.lilaPrincipal,C.textoPrincipal);
-    if (exportOpts.separated) drawSection("separated","🕐 Separados",C.rosaFondo,C.rosaPrincipal,C.textoPrincipal);
-    if (exportOpts.sold)      drawSection("sold","✓ Vendidos",C.fondoOscuro,"#7a5c8a","#ffffff");
+    // ── Leyenda de colores ──
+    const legend = [
+      exportOpts.available && ["#f1e3f5", C.lilaPrincipal, C.textoPrincipal, "Disponible"],
+      exportOpts.separated && ["#fde4ef", C.rosaPrincipal, C.textoPrincipal, "Separado"],
+      exportOpts.sold      && [C.fondoOscuro, "#7a5c8a", "#ffffff", "Vendido"],
+    ].filter(Boolean);
 
-    const fy=Math.max(y+24,1730);
-    ctx.fillStyle=C.fondoOscuro; rRect(ctx,60,fy,960,154,20); ctx.fill();
-    ctx.fillStyle=C.rosaSuave; ctx.font="italic 700 66px Georgia,serif";
-    ctx.textAlign="center"; ctx.fillText("$10.00",300,fy+100);
-    ctx.strokeStyle="rgba(255,255,255,.22)"; ctx.lineWidth=2; ctx.setLineDash([4,7]);
-    ctx.beginPath(); ctx.moveTo(510,fy+18); ctx.lineTo(510,fy+136); ctx.stroke(); ctx.setLineDash([]);
-    ctx.fillStyle="rgba(255,255,255,.85)"; ctx.font="italic 36px Georgia,serif";
-    ctx.fillText("¡Participa y ayuda a una buena causa!",790,fy+88);
+    let legendX = 540 - (legend.length * 180) / 2 + 60;
+    legend.forEach(([bg, bd, tx, label]) => {
+      ctx.fillStyle = bg; ctx.strokeStyle = bd; ctx.lineWidth = 2;
+      rRect(ctx, legendX - 20, 638, 38, 38, 8); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = C.textoMedio; ctx.font = "26px Inter,sans-serif";
+      ctx.textAlign = "left"; ctx.fillText(label, legendX + 24, 664);
+      legendX += 180;
+    });
+
+    // ── Grid unificado con todos los boletos coloreados ──
+    const cols = 9, cw = 100, ch = 74, gap = 9;
+    const gridW = cols * cw + (cols - 1) * gap;
+    const sx = (1080 - gridW) / 2;
+    const gridStartY = 690;
+
+    const COLORS = {
+      available: { bg:"#f1e3f5", bd:C.lilaPrincipal, tx:C.textoPrincipal },
+      separated: { bg:"#fde4ef", bd:C.rosaPrincipal,  tx:C.textoPrincipal },
+      sold:      { bg:C.fondoOscuro, bd:"#7a5c8a",    tx:"#ffffff" },
+    };
+
+    // Decide qué boletos pintar según opciones seleccionadas
+    const toShow = (tickets??[]).filter(t =>
+      (t.status==="available" && exportOpts.available) ||
+      (t.status==="separated" && exportOpts.separated) ||
+      (t.status==="sold"      && exportOpts.sold)
+    );
+
+    // Recorremos todos del 000 al 100 para mantener posición fija en el grid
+    (tickets??[]).forEach((t, i) => {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const cx = sx + col * (cw + gap);
+      const cy = gridStartY + row * (ch + gap);
+      const visible = toShow.find(x => x.number === t.number);
+      const clr = visible ? COLORS[t.status] : null;
+
+      if (!clr) {
+        // Boleto no incluido: dibuja hueco gris muy suave
+        ctx.fillStyle = "rgba(200,190,210,0.18)";
+        ctx.strokeStyle = "rgba(200,190,210,0.3)";
+        ctx.lineWidth = 1.5;
+        rRect(ctx, cx, cy, cw, ch, 12); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = "rgba(160,140,170,0.4)";
+        ctx.font = "bold 26px 'Courier New',monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(t.number, cx + cw/2, cy + ch/2 + 9);
+        return;
+      }
+
+      ctx.fillStyle = clr.bg; ctx.strokeStyle = clr.bd; ctx.lineWidth = 2;
+      rRect(ctx, cx, cy, cw, ch, 12); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = clr.tx; ctx.font = "bold 30px 'Courier New',monospace";
+      ctx.textAlign = "center"; ctx.fillText(t.number, cx + cw/2, cy + ch/2 + 10);
+    });
+
+    const rows = Math.ceil((tickets??[]).length / cols);
+    const y = gridStartY + rows * (ch + gap) + 32;
+
+    // ── Footer ticket block ──
+    const fh = 160;
+    const fy = Math.max(y, 1920 - fh - 40);
+    ctx.fillStyle = C.fondoOscuro;
+    rRect(ctx, 60, fy, 960, fh, 20); ctx.fill();
+
+    // Notches decorativos
+    ctx.fillStyle = "#f1e3f5";
+    ctx.beginPath(); ctx.arc(60,  fy + fh/2, 18, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(1020, fy + fh/2, 18, 0, Math.PI*2); ctx.fill();
+
+    // Precio
+    ctx.fillStyle = C.rosaSuave;
+    ctx.font = "italic 700 68px Georgia,serif";
+    ctx.textAlign = "center";
+    ctx.fillText("$10.00", 280, fy + fh/2 + 22);
+
+    // Separador punteado
+    ctx.strokeStyle = "rgba(255,255,255,.25)"; ctx.lineWidth = 2; ctx.setLineDash([4,8]);
+    ctx.beginPath(); ctx.moveTo(490, fy+18); ctx.lineTo(490, fy+fh-18); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Texto derecho en dos líneas para que no se corte
+    ctx.fillStyle = "rgba(255,255,255,.88)";
+    ctx.font = "italic 32px Georgia,serif";
+    ctx.textAlign = "center";
+    ctx.fillText("¡Participa y ayuda a", 765, fy + fh/2 - 4);
+    ctx.fillText("una buena causa! 💗", 765, fy + fh/2 + 38);
 
     const link=document.createElement("a"); link.download="tombola-laya-luccia.png";
     link.href=canvas.toDataURL("image/png"); link.click();
